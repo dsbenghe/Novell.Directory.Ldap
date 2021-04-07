@@ -78,7 +78,7 @@ namespace Novell.Directory.Ldap
 
         internal const string Security = "simple";
 
-        private readonly object _lock = new object();
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
         // When set to true the client connection is up and running
         private bool _clientActive = true;
@@ -90,7 +90,7 @@ namespace Novell.Directory.Ldap
         // Number of clones in addition to original LdapConnection using this
         // connection.
         private int _cloneCount;
-        private Thread _deadReader; // Identity of last reader thread
+        private Task _deadReader; // Identity of last reader thread
         private Exception _deadReaderException; // Last exception of reader
         private readonly LberDecoder _decoder;
 
@@ -108,7 +108,7 @@ namespace Novell.Directory.Ldap
         private readonly MessageVector _messages;
         private TcpClient _nonTlsBackup;
         private Stream _outStream;
-        private Thread _reader; // New thread that reads data from the server.
+        private Task _reader; // New thread that reads data from the server.
 
         private ReaderThread _readerThreadEnclosure;
 
@@ -381,7 +381,7 @@ namespace Novell.Directory.Ldap
         * @param the thread id to match
         */
 
-        private void WaitForReader(Thread thread)
+        private void WaitForReader(Task thread)
         {
             // wait for previous reader thread to terminate
             var rInst = _reader;
@@ -413,10 +413,10 @@ namespace Novell.Directory.Ldap
                         readerException);
                 }
 
-                lock (_lock)
+                /*lock (_lock)
                 {
                     Monitor.Wait(_lock, TimeSpan.FromMilliseconds(5));
-                }
+                }*/
 
                 rInst = _reader;
                 tInst = thread;
@@ -435,9 +435,9 @@ namespace Novell.Directory.Ldap
         /// <param name="port">
         ///     The port on the host to connect to.
         /// </param>
-        internal Task ConnectAsync(string host, int port)
+        internal Task ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
-            return ConnectAsync(host, port, 0);
+            return ConnectAsync(host, port, 0, cancellationToken);
         }
 
         /****************************************************************************/
@@ -502,7 +502,7 @@ namespace Novell.Directory.Ldap
         /// <param name="semaphoreId">
         ///     The write semaphore ID to use for the connect.
         /// </param>
-        private async Task ConnectAsync(string host, int port, int semaphoreId)
+        private async Task ConnectAsync(string host, int port, int semaphoreId, CancellationToken cancellationToken)
         {
             /* Synchronized so all variables are in a consistant state and
             * so that another thread isn't doing a connect, disconnect, or clone
@@ -532,13 +532,22 @@ namespace Novell.Directory.Ldap
                         Host = host;
                         Port = port;
 
+                        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+                        if (ConnectionTimeout > 0)
+                        {
+                            cts.CancelAfter(ConnectionTimeout);
+                        }
+
+                        cancellationToken = cts.Token;
+
                         if (!IPAddress.TryParse(host, out var ipAddress))
                         {
-                            var ipAddresses = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
+                            var ipAddresses = await Dns.GetHostAddressesAsync(host).WithCancellation(cancellationToken).ConfigureAwait(false);
                             ipAddress = ipAddresses
                                 .Where(x => _ldapConnectionOptions.IpAddressFilter(x))
                                 .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork
-                                             || ip.AddressFamily == AddressFamily.InterNetworkV6);
+                                                      || ip.AddressFamily == AddressFamily.InterNetworkV6);
 
                             if (ipAddress == null)
                             {
@@ -549,8 +558,10 @@ namespace Novell.Directory.Ldap
                         if (_ldapConnectionOptions.Ssl)
                         {
                             _sock = new Socket(ipAddress.AddressFamily, SocketType.Stream, ProtocolType.IP);
+
                             var ipEndPoint = new IPEndPoint(ipAddress, port);
-                            await _sock.ConnectAsync(ipEndPoint).TimeoutAfterAsync(ConnectionTimeout).ConfigureAwait(false);
+
+                            await _sock.ConnectAsync(ipEndPoint, cancellationToken).ConfigureAwait(false);
 
                             var sslStream = new SslStream(
                                 new NetworkStream(_sock, true),
@@ -562,7 +573,7 @@ namespace Novell.Directory.Ldap
                                     new X509CertificateCollection(_ldapConnectionOptions.ClientCertificates.ToArray()),
                                     _ldapConnectionOptions.SslProtocols,
                                     _ldapConnectionOptions.CheckCertificateRevocationEnabled)
-                                .TimeoutAfterAsync(ConnectionTimeout)
+                                .WithCancellation(cancellationToken)
                                 .ConfigureAwait(false);
 
                             _inStream = sslStream;
@@ -571,7 +582,7 @@ namespace Novell.Directory.Ldap
                         else
                         {
                             _socket = new TcpClient(ipAddress.AddressFamily);
-                            await _socket.ConnectAsync(host, port).TimeoutAfterAsync(ConnectionTimeout).ConfigureAwait(false);
+                            await _socket.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
 
                             _inStream = _socket.GetStream();
                             _outStream = _socket.GetStream();
@@ -581,6 +592,13 @@ namespace Novell.Directory.Ldap
                     {
                         Console.WriteLine("connect input/out Stream specified");
                     }
+                }
+                catch (OperationCanceledException oce)
+                {
+                    _sock = null;
+                    _socket = null;
+                    throw new LdapException(ExceptionMessages.ConnectionError, new object[] { host, port },
+                        LdapException.ConnectError, null, oce);
                 }
                 catch (SocketException se)
                 {
@@ -614,10 +632,7 @@ namespace Novell.Directory.Ldap
         /// <summary>  Increments the count of cloned connections.</summary>
         internal void IncrCloneCount()
         {
-            lock (_lock)
-            {
-                _cloneCount++;
-            }
+            Interlocked.Increment(ref _cloneCount);
         }
 
         /// <summary>
@@ -646,9 +661,10 @@ namespace Novell.Directory.Ldap
         /// <returns>
         ///     a Connection object or null if finalizing.
         /// </returns>
-        internal Connection DestroyClone()
+        internal async Task<Connection> DestroyClone(CancellationToken cancellationToken)
         {
-            lock (_lock)
+            await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
                 var conn = this;
 
@@ -674,11 +690,15 @@ namespace Novell.Directory.Ldap
                             LdapException.ConnectError, null, null);
 
                         // Destroy old connection
-                        Destroy("destroy clone", 0, notify);
+                        await Destroy("destroy clone", 0, notify, cancellationToken).ConfigureAwait(false);
                     }
                 }
 
                 return conn;
+            }
+            finally
+            {
+                _semaphore.Release();
             }
         }
 
@@ -713,20 +733,20 @@ namespace Novell.Directory.Ldap
         /// <param name="info">
         ///     the Message containing the message to write.
         /// </param>
-        internal async Task WriteMessageAsync(Message info)
+        internal async Task WriteMessageAsync(Message info, CancellationToken cancellationToken)
         {
             _messages.Add(info);
 
             // For bind requests, if not connected, attempt to reconnect
             if (info.BindRequest && Connected == false && Host != null)
             {
-                await ConnectAsync(Host, Port, info.MessageId).ConfigureAwait(false);
+                await ConnectAsync(Host, Port, info.MessageId, cancellationToken).ConfigureAwait(false);
             }
 
             if (Connected)
             {
                 var msg = info.Request;
-                WriteMessage(msg);
+                await WriteMessage(msg, cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -741,7 +761,7 @@ namespace Novell.Directory.Ldap
         /// <param name="msg">
         ///     the message to write.
         /// </param>
-        internal void WriteMessage(LdapMessage msg)
+        internal async Task WriteMessage(LdapMessage msg, CancellationToken cancellationToken)
         {
             int id;
 
@@ -773,8 +793,8 @@ namespace Novell.Directory.Ldap
                 }
 
                 var ber = msg.Asn1Object.GetEncoding(_encoder);
-                myOut.Write(ber, 0, ber.Length);
-                myOut.Flush();
+                await myOut.WriteAsync(ber, 0, ber.Length, cancellationToken).ConfigureAwait(false);
+                await myOut.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (IOException ioe)
             {
@@ -834,7 +854,7 @@ namespace Novell.Directory.Ldap
             _messages.Remove(info);
         }
 
-        private void Destroy(string reason, int semaphoreId, InterThreadException notifyUser)
+        private async Task Destroy(string reason, int semaphoreId, InterThreadException notifyUser, CancellationToken cancellationToken)
         {
             if (!_clientActive)
             {
@@ -842,7 +862,7 @@ namespace Novell.Directory.Ldap
             }
 
             _clientActive = false;
-            AbandonMessages(notifyUser);
+            await AbandonMessages(notifyUser, cancellationToken).ConfigureAwait(false);
 
             var semId = AcquireWriteSemaphore(semaphoreId);
             try
@@ -854,8 +874,8 @@ namespace Novell.Directory.Ldap
                     {
                         var msg = new LdapUnbindRequest(null);
                         var ber = msg.Asn1Object.GetEncoding(_encoder);
-                        _outStream.Write(ber, 0, ber.Length);
-                        _outStream.Flush();
+                        await _outStream.WriteAsync(ber, 0, ber.Length, cancellationToken).ConfigureAwait(false);
+                        await _outStream.FlushAsync(cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception)
                     {
@@ -869,14 +889,26 @@ namespace Novell.Directory.Ldap
                     // Just before closing the sockets, abort the reader thread
                     if (_reader != null && reason != "reader: thread stopping")
                     {
-                        _readerThreadEnclosure.Stop();
+                        await _readerThreadEnclosure.Stop().ConfigureAwait(false);
                     }
 
                     // Close the socket
                     try
                     {
+#if NETSTANDARD2_0
                         _inStream?.Dispose();
                         _outStream?.Dispose();
+#else
+                        if (_inStream != null)
+                        {
+                            await _inStream.DisposeAsync().ConfigureAwait(false);
+                        }
+
+                        if (_outStream != null)
+                        {
+                            await _outStream.DisposeAsync().ConfigureAwait(false);
+                        }
+#endif
                         _sock?.Dispose();
                         _socket?.Dispose();
                     }
@@ -897,13 +929,13 @@ namespace Novell.Directory.Ldap
             }
         }
 
-        private void AbandonMessages(InterThreadException notifyUser)
+        private async Task AbandonMessages(InterThreadException notifyUser, CancellationToken cancellationToken)
         {
             // remove messages from connection list and send abandon
             var leftMessages = _messages.RemoveAll();
             foreach (Message message in leftMessages)
             {
-                message.Abandon(null, notifyUser); // also notifies the application
+                await message.Abandon(null, notifyUser, cancellationToken).ConfigureAwait(false); // also notifies the application
             }
         }
 
@@ -962,13 +994,9 @@ namespace Novell.Directory.Ldap
         /// </summary>
         private void StartReader()
         {
-            // Start Reader Thread
-            var r = new Thread(new ReaderThread(this).Run)
-            {
-                IsBackground = true, // If the last thread running, allow exit.
-            };
-            r.Start();
-            WaitForReader(r);
+            // Start Reader Task
+            Task t = null;
+            WaitForReader(t = Task.Run(() => new ReaderThread(this).Run(t)));
         }
 
         /// <summary>
@@ -982,7 +1010,7 @@ namespace Novell.Directory.Ldap
         ///     stop and start the reader thread.  Connection.StopTLS will stop
         ///     and start the reader thread.
         /// </summary>
-        internal async Task StartTlsAsync()
+        internal async Task StartTlsAsync(CancellationToken cancellationToken)
         {
             try
             {
@@ -993,13 +1021,22 @@ namespace Novell.Directory.Ldap
                     true,
                     RemoteCertificateValidationCallback,
                     LocalCertificateSelectionCallback);
-                await sslStream.AuthenticateAsClientAsync(
-                        Host,
-                        new X509CertificateCollection(_ldapConnectionOptions.ClientCertificates.ToArray()),
-                        _ldapConnectionOptions.SslProtocols,
-                        _ldapConnectionOptions.CheckCertificateRevocationEnabled)
-                    .TimeoutAfterAsync(ConnectionTimeout)
-                    .ConfigureAwait(false);
+
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                {
+                    if (ConnectionTimeout > 0)
+                    {
+                        cts.CancelAfter(ConnectionTimeout);
+                    }
+
+                    await sslStream.AuthenticateAsClientAsync(
+                            Host,
+                            new X509CertificateCollection(_ldapConnectionOptions.ClientCertificates.ToArray()),
+                            _ldapConnectionOptions.SslProtocols,
+                            _ldapConnectionOptions.CheckCertificateRevocationEnabled)
+                        .WithCancellation(cts.Token)
+                        .ConfigureAwait(false);
+                }
 
                 _inStream = sslStream;
                 _outStream = sslStream;
@@ -1115,7 +1152,7 @@ namespace Novell.Directory.Ldap
         public class ReaderThread
         {
             private readonly Connection _enclosingInstance;
-            private Thread _enclosedThread;
+            private Task _enclosedThread;
             private bool _isStopping;
 
             public ReaderThread(Connection enclosingInstance)
@@ -1123,11 +1160,11 @@ namespace Novell.Directory.Ldap
                 _enclosingInstance = enclosingInstance;
             }
 
-            public void Stop()
+            public ValueTask Stop()
             {
                 if (_enclosedThread == null)
                 {
-                    return;
+                    return default;
                 }
 
                 _isStopping = true;
@@ -1143,21 +1180,21 @@ namespace Novell.Directory.Ldap
                 var socketStream = _enclosingInstance._inStream;
                 socketStream?.Dispose();
 
-                _enclosedThread.Join();
+                return new ValueTask(_enclosedThread);
             }
 
             /// <summary>
             ///     This thread decodes and processes RfcLdapMessage's from the server.
             ///     Note: This thread needs a graceful shutdown implementation.
             /// </summary>
-            public void Run()
+            public async Task Run(Task task)
             {
                 var reason = "reader: thread stopping";
                 InterThreadException notify = null;
                 Message info = null;
                 Exception readerException = null;
                 _enclosingInstance._readerThreadEnclosure = this;
-                _enclosingInstance._reader = _enclosedThread = Thread.CurrentThread;
+                _enclosingInstance._reader = _enclosedThread = task;
                 try
                 {
                     while (!_isStopping)
@@ -1184,7 +1221,7 @@ namespace Novell.Directory.Ldap
                         // Turn the message into an RfcMessage class
                         var asn1Len = new Asn1Length(myIn);
 
-                        var msg = new RfcLdapMessage(_enclosingInstance._decoder, myIn, asn1Len.Length);
+                        var msg = await RfcLdapMessage.Decode(_enclosingInstance._decoder, myIn, asn1Len.Length, default).ConfigureAwait(false);
 
                         // ------------------------------------------------------------
                         // Process the decoded RfcLdapMessage.
@@ -1291,7 +1328,7 @@ namespace Novell.Directory.Ldap
                     if (!_enclosingInstance._clientActive || notify != null)
                     {
                         // #3 & 4
-                        _enclosingInstance.Destroy(reason, 0, notify);
+                        _enclosingInstance.Destroy(reason, 0, notify, default).GetAwaiter().GetResult();
                     }
                     else
                     {
